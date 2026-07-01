@@ -180,7 +180,10 @@ class AccountCheckerService : Service() {
             return
         }
 
-        // ── Fix: reset stuck IN_PROGRESS accounts back to PENDING ─────────────
+        // Guard: prevent launching a second coroutine while one is already running
+        if (isRunning) return
+
+        // Reset stuck IN_PROGRESS accounts back to PENDING (crash/stop recovery)
         repo.resetInProgress()
 
         if (repo.getNextPending() == null) {
@@ -208,7 +211,14 @@ class AccountCheckerService : Service() {
                 // ── Step 1: Open GARENA ──────────────────────────────────────
                 withContext(Dispatchers.Main) { updateOverlay("Opening GARENA…", shortUser, buildCountsText()) }
 
-                val svc = AutoClickAccessibilityService.instance ?: break
+                val svc = AutoClickAccessibilityService.instance
+                if (svc == null) {
+                    // Accessibility service disconnected — put account back to PENDING and wait
+                    repo.setStatus(account.id, AccountStatus.PENDING)
+                    withContext(Dispatchers.Main) { updateOverlay("Waiting for accessibility…", shortUser, buildCountsText()) }
+                    delay(3000)
+                    continue
+                }
 
                 val garenaPoint = withContext(Dispatchers.IO) { svc.findNodeCenter("GARENA") }
                 if (garenaPoint != null) {
@@ -313,7 +323,7 @@ class AccountCheckerService : Service() {
                                 dismissDialog(svc)
                                 resultHandled = true
                             }
-                            hit != null && (hit.contains("Login failed") || hit.contains("incorrect")) -> {
+                            hit != null && (hit.contains("login failed") || hit.contains("incorrect")) -> {
                                 Log.d(TAG, "INVALID (late): ${account.username}")
                                 repo.setStatus(account.id, AccountStatus.INVALID, "Login failed")
                                 withContext(Dispatchers.Main) { updateOverlay("Invalid ✗", shortUser, buildCountsText()) }
@@ -340,9 +350,10 @@ class AccountCheckerService : Service() {
     }
 
     private fun stopChecker() {
+        // Set isRunning = false FIRST so the loop condition fails immediately
+        isRunning = false
         checkerJob?.cancel()
         checkerJob = null
-        isRunning = false
         // Reset any IN_PROGRESS back to PENDING so next start picks them up
         if (::repo.isInitialized) repo.resetInProgress()
         updateOverlay("Stopped", "", buildCountsText())

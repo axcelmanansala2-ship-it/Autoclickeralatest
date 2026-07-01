@@ -213,41 +213,86 @@ class AccountCheckerService : Service() {
 
                 val svc = AutoClickAccessibilityService.instance
                 if (svc == null) {
-                    // Accessibility service disconnected — put account back to PENDING and wait
                     repo.setStatus(account.id, AccountStatus.PENDING)
                     withContext(Dispatchers.Main) { updateOverlay("Waiting for accessibility…", shortUser, buildCountsText()) }
                     delay(3000)
                     continue
                 }
 
-                val garenaPoint = withContext(Dispatchers.IO) { svc.findNodeCenter("GARENA") }
-                if (garenaPoint != null) {
-                    svc.tap(garenaPoint.x, garenaPoint.y)
-                } else {
+                // CODM is a Unity game — its main-screen buttons (GUEST/GARENA/Facebook)
+                // are rendered via OpenGL and are NOT in the Android accessibility tree.
+                // Strategy:
+                //  1. Try accessibility first (works if Unity exposes nodes on this device)
+                //  2. Launch CODM if not already foreground, wait for it to load
+                //  3. Retry accessibility after load
+                //  4. Fall back to a proportional coordinate tap at the GARENA button position
+                var garenaPoint = withContext(Dispatchers.IO) { svc.findNodeCenter("GARENA") }
+
+                if (garenaPoint == null) {
+                    // Bring CODM to foreground (or launch it)
                     val launched = withContext(Dispatchers.Main) { tryLaunchCODM() }
                     if (!launched) {
-                        Log.w(TAG, "Could not find GARENA or launch CODM")
+                        Log.w(TAG, "Could not launch CODM")
                         repo.setStatus(account.id, AccountStatus.PENDING)
                         delay(3000)
                         continue
                     }
+
+                    // Wait for the game main menu to fully render (Unity can be slow)
+                    withContext(Dispatchers.Main) { updateOverlay("Waiting CODM…", shortUser, buildCountsText()) }
+                    delay(5000)
+
+                    // Retry accessibility after the game has loaded
+                    garenaPoint = withContext(Dispatchers.IO) { svc.findNodeCenter("GARENA") }
                 }
 
-                // ── Step 2: Wait for Garena login screen ─────────────────────
+                if (garenaPoint != null) {
+                    Log.d(TAG, "GARENA found via accessibility at $garenaPoint")
+                    svc.tap(garenaPoint.x, garenaPoint.y)
+                } else {
+                    // Unity UI not in accessibility tree — tap at proportional screen coordinate.
+                    // In landscape CODM, GARENA is the center button of 3 login options,
+                    // positioned at ~50% width and ~81% height of the display.
+                    val (sw, sh) = withContext(Dispatchers.Main) { getScreenSize() }
+                    val gx = sw * 0.50f
+                    val gy = sh * 0.81f
+                    Log.d(TAG, "GARENA not in tree — coordinate tap at ($gx, $gy) on ${sw}x${sh}")
+                    withContext(Dispatchers.Main) { updateOverlay("Tapping GARENA…", shortUser, buildCountsText()) }
+                    svc.tap(gx, gy)
+                }
+
+                // ── Step 2: Wait for Garena native login screen ───────────────
+                // The Garena login IS a native Android activity, so accessibility
+                // can find its text fields once it opens.
                 withContext(Dispatchers.Main) { updateOverlay("Waiting login…", shortUser, buildCountsText()) }
 
                 var loginReady = false
-                repeat(24) {  // 24 × 500ms = 12s
-                    if (!loginReady) {
-                        val found = withContext(Dispatchers.IO) {
-                            svc.hasAnyText("Garena Username", "Login Now", "Email or Phone")
+                var loginPollCount = 0
+                while (!loginReady && loginPollCount < 40 && isActive) {  // max 20s
+                    val found = withContext(Dispatchers.IO) {
+                        svc.hasAnyText("Garena Username", "Login Now", "Email or Phone")
+                    }
+                    if (found != null) {
+                        loginReady = true
+                    } else {
+                        loginPollCount++
+                        // After 8 seconds (16 polls) with no login screen, retry the GARENA tap
+                        if (loginPollCount == 16) {
+                            Log.d(TAG, "Login screen not found after 8s — retrying GARENA tap")
+                            val retryPoint = withContext(Dispatchers.IO) { svc.findNodeCenter("GARENA") }
+                            if (retryPoint != null) {
+                                svc.tap(retryPoint.x, retryPoint.y)
+                            } else {
+                                val (sw, sh) = withContext(Dispatchers.Main) { getScreenSize() }
+                                svc.tap(sw * 0.50f, sh * 0.81f)
+                            }
                         }
-                        if (found != null) loginReady = true else delay(500)
+                        delay(500)
                     }
                 }
 
                 if (!loginReady) {
-                    Log.w(TAG, "Login screen not found")
+                    Log.w(TAG, "Login screen not found after 20s")
                     repo.setStatus(account.id, AccountStatus.PENDING)
                     delay(2000)
                     continue
@@ -357,6 +402,22 @@ class AccountCheckerService : Service() {
         // Reset any IN_PROGRESS back to PENDING so next start picks them up
         if (::repo.isInitialized) repo.resetInProgress()
         updateOverlay("Stopped", "", buildCountsText())
+    }
+
+    // ─── Screen size helper ───────────────────────────────────────────────────
+
+    /** Returns (width, height) of the default display in pixels. Must run on Main. */
+    private fun getScreenSize(): Pair<Float, Float> {
+        val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val bounds = wm.currentWindowMetrics.bounds
+            Pair(bounds.width().toFloat(), bounds.height().toFloat())
+        } else {
+            val size = android.graphics.Point()
+            @Suppress("DEPRECATION")
+            wm.defaultDisplay.getSize(size)
+            Pair(size.x.toFloat(), size.y.toFloat())
+        }
     }
 
     // ─── App launch fallback ──────────────────────────────────────────────────

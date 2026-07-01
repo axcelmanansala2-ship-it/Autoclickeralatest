@@ -195,44 +195,26 @@ class FloatingOverlayService : Service() {
                 val target = enabledTargets[stepIdx]
                 val total = enabledTargets.size
 
-                withContext(Dispatchers.Main) {
-                    updateUI("Searching…", "Step ${stepIdx + 1}/$total")
-                }
-
-                // ── Strategy 1: AccessibilityService node finding ──────────────
+                // Search the accessibility node tree for the target text
                 val tapPoint = withContext(Dispatchers.IO) {
                     AutoClickAccessibilityService.instance?.findNodeCenter(target.textQuery)
                 }
 
+                Log.d(TAG, "Step $stepIdx '${target.textQuery}' → $tapPoint")
+
                 if (tapPoint != null) {
-                    Log.d(TAG, "Step $stepIdx '${target.textQuery}' → node tap at $tapPoint")
                     withContext(Dispatchers.Main) {
-                        updateUI("Tapped!", "Step ${stepIdx + 1}/$total")
+                        updateUI("Tapped! Wait…", "Step ${stepIdx + 1}/$total")
                     }
                     AutoClickAccessibilityService.instance?.tap(tapPoint.x, tapPoint.y)
                     currentStepIndex++
                     delay(target.delayAfterMs)
-                    continue
-                }
-
-                // ── Strategy 2: App launch fallback (for launcher icons) ────────
-                val launched = withContext(Dispatchers.Main) {
-                    tryLaunchApp(target.textQuery)
-                }
-
-                if (launched) {
-                    Log.d(TAG, "Step $stepIdx '${target.textQuery}' → launched app")
+                } else {
                     withContext(Dispatchers.Main) {
-                        updateUI("Launched!", "Step ${stepIdx + 1}/$total")
+                        updateUI("Searching…", "Step ${stepIdx + 1}/$total")
                     }
-                    currentStepIndex++
-                    // Give the app time to open before next step
-                    delay(maxOf(target.delayAfterMs, 1500L))
-                    continue
+                    delay(POLL_INTERVAL_MS)
                 }
-
-                // ── Nothing found — keep polling ────────────────────────────────
-                delay(POLL_INTERVAL_MS)
             }
 
             // Loop ended (targets removed, cancelled, or stopped) — always clean up state

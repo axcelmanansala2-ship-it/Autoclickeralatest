@@ -171,6 +171,10 @@ class FloatingOverlayService : Service() {
             Toast.makeText(this, getString(R.string.msg_accessibility_needed), Toast.LENGTH_LONG).show()
             return
         }
+
+        // Guard: if already running, ignore — user must tap STOP first
+        if (isDetecting) return
+
         val targets = TargetRepository(this).getAll().filter { it.enabled }
         if (targets.isEmpty()) {
             Toast.makeText(this, getString(R.string.msg_no_targets), Toast.LENGTH_SHORT).show()
@@ -230,13 +234,21 @@ class FloatingOverlayService : Service() {
                 // ── Nothing found — keep polling ────────────────────────────────
                 delay(POLL_INTERVAL_MS)
             }
+
+            // Loop ended (targets removed, cancelled, or stopped) — always clean up state
+            withContext(Dispatchers.Main) {
+                isDetecting = false
+                currentStepIndex = 0
+                updateUI("Idle", "")
+            }
         }
     }
 
     private fun stopDetection() {
+        // Set isDetecting = false FIRST so the loop condition fails immediately
+        isDetecting = false
         detectionJob?.cancel()
         detectionJob = null
-        isDetecting = false
         currentStepIndex = 0
         updateUI("Stopped", "")
     }

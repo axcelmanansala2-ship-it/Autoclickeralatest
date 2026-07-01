@@ -178,16 +178,22 @@ class AutoClickAccessibilityService : AccessibilityService() {
 
     fun tap(x: Float, y: Float, onDone: (() -> Unit)? = null) {
         Log.d(TAG, "tap($x, $y)")
-        val path = Path().apply { moveTo(x, y) }
-        val stroke = GestureDescription.StrokeDescription(path, 0L, 80L)
+        // Use moveTo + lineTo with a sub-pixel offset so the path is always non-empty,
+        // which prevents gesture cancellation on some Android versions.
+        val path = Path().apply {
+            moveTo(x, y)
+            lineTo(x, y + 1f)
+        }
+        val stroke = GestureDescription.StrokeDescription(path, 0L, 100L)
         val gesture = GestureDescription.Builder().addStroke(stroke).build()
-        dispatchGesture(gesture, object : GestureResultCallback() {
+        val dispatched = dispatchGesture(gesture, object : GestureResultCallback() {
             override fun onCompleted(g: GestureDescription?) { onDone?.invoke() }
             override fun onCancelled(g: GestureDescription?) {
                 Log.w(TAG, "tap cancelled at ($x,$y)")
                 onDone?.invoke()
             }
         }, null)
+        if (!dispatched) Log.w(TAG, "tap($x,$y) — dispatchGesture returned false (service not ready?)")
     }
 
     // ─── Global actions ───────────────────────────────────────────────────────

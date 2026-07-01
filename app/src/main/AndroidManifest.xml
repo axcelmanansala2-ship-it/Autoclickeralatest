@@ -1,16 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- Overlay permission -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
-    <!-- Foreground service -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
-    <!-- Screen capture -->
-    <uses-permission android:name="android.permission.MEDIA_PROJECTION" />
-    <!-- Wake lock to keep detection running -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
-    <!-- Post notifications (Android 13+) -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
@@ -38,13 +31,17 @@
             android:label="@string/title_target_setup"
             android:parentActivityName=".MainActivity" />
 
-        <!-- Floating overlay + detection foreground service -->
+        <!-- Floating overlay service — no media projection needed anymore -->
         <service
             android:name=".FloatingOverlayService"
             android:exported="false"
-            android:foregroundServiceType="mediaProjection" />
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="overlay" />
+        </service>
 
-        <!-- Accessibility service for performing taps -->
+        <!-- Accessibility service for node finding + tapping -->
         <service
             android:name=".AutoClickAccessibilityService"
             android:exported="true"

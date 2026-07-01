@@ -8,8 +8,6 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.graphics.PixelFormat
-import android.media.projection.MediaProjection
-import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
@@ -32,8 +30,16 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /**
- * Foreground service that shows a floating overlay and runs the sequential
- * detection loop: Step 1 → find target[0] text → tap → Step 2 → find target[1] → tap → repeat.
+ * Foreground service — floating Start/Stop overlay + sequential detection loop.
+ *
+ * Detection now uses AutoClickAccessibilityService.findNodeCenter() which reads
+ * the actual Android UI tree instead of OCR screenshots. This is more accurate,
+ * faster, and not confused by wallpapers or the overlay itself.
+ *
+ * Sequential flow:
+ *   Step 1: search for target[0].textQuery → if found, tap → advance to step 2
+ *   Step 2: search for target[1].textQuery → if found, tap → back to step 1
+ *   ...and so on indefinitely until STOP is pressed.
  */
 class FloatingOverlayService : Service() {
 
@@ -42,8 +48,6 @@ class FloatingOverlayService : Service() {
     private lateinit var binding: OverlayControlBinding
     private lateinit var layoutParams: WindowManager.LayoutParams
 
-    private var screenCaptureManager: ScreenCaptureManager? = null
-    private val detectionEngine = DetectionEngine()
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private var detectionJob: Job? = null
     private var isDetecting = false
@@ -56,27 +60,15 @@ class FloatingOverlayService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
-            ACTION_START_WITH_PROJECTION -> {
-                val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, -1)
-                val data = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    intent.getParcelableExtra(EXTRA_PROJECTION_DATA, Intent::class.java)
-                } else {
-                    @Suppress("DEPRECATION")
-                    intent.getParcelableExtra(EXTRA_PROJECTION_DATA)
-                }
-                if (data != null) initProjection(resultCode, data)
-            }
-            ACTION_STOP -> stopSelf()
-        }
+        if (intent?.action == ACTION_STOP) stopSelf()
         return START_STICKY
     }
 
     override fun onDestroy() {
         stopDetection()
-        detectionEngine.close()
-        screenCaptureManager?.release()
-        if (::overlayView.isInitialized) windowManager.removeView(overlayView)
+        if (::overlayView.isInitialized) {
+            try { windowManager.removeView(overlayView) } catch (_: Exception) {}
+        }
         super.onDestroy()
     }
 
@@ -115,24 +107,18 @@ class FloatingOverlayService : Service() {
     }
 
     private fun setupDrag() {
-        var initialX = 0; var initialY = 0
+        var initX = 0; var initY = 0
         var touchX = 0f; var touchY = 0f
-        var moved = false
 
         overlayView.setOnTouchListener { _, event ->
             when (event.action) {
                 MotionEvent.ACTION_DOWN -> {
-                    initialX = layoutParams.x; initialY = layoutParams.y
-                    touchX = event.rawX; touchY = event.rawY
-                    moved = false
-                    true
+                    initX = layoutParams.x; initY = layoutParams.y
+                    touchX = event.rawX; touchY = event.rawY; true
                 }
                 MotionEvent.ACTION_MOVE -> {
-                    val dx = (touchX - event.rawX).toInt()
-                    val dy = (event.rawY - touchY).toInt()
-                    if (Math.abs(dx) > 5 || Math.abs(dy) > 5) moved = true
-                    layoutParams.x = initialX + dx
-                    layoutParams.y = initialY + dy
+                    layoutParams.x = initX + (touchX - event.rawX).toInt()
+                    layoutParams.y = initY + (event.rawY - touchY).toInt()
                     windowManager.updateViewLayout(overlayView, layoutParams)
                     true
                 }
@@ -141,23 +127,14 @@ class FloatingOverlayService : Service() {
         }
     }
 
-    private fun updateUI(status: String, lookingFor: String) {
+    private fun updateUI(status: String, step: String) {
         binding.btnToggle.text = if (isDetecting) "STOP" else "START"
         binding.btnToggle.setBackgroundColor(
             if (isDetecting) getColor(R.color.colorOverlayStop)
             else getColor(R.color.colorOverlayStart)
         )
         binding.tvStatus.text = status
-        binding.tvLookingFor.text = if (lookingFor.isNotEmpty()) "→ $lookingFor" else ""
-    }
-
-    // ─── MediaProjection ─────────────────────────────────────────────────────
-
-    private fun initProjection(resultCode: Int, data: Intent) {
-        val pm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        val projection: MediaProjection = pm.getMediaProjection(resultCode, data)
-        screenCaptureManager = ScreenCaptureManager(this, projection)
-        Log.d(TAG, "MediaProjection ready")
+        binding.tvStep.text = step
     }
 
     // ─── Sequential Detection Loop ────────────────────────────────────────────
@@ -165,11 +142,6 @@ class FloatingOverlayService : Service() {
     private fun startDetection() {
         if (!AutoClickAccessibilityService.isConnected) {
             Toast.makeText(this, getString(R.string.msg_accessibility_needed), Toast.LENGTH_LONG).show()
-            return
-        }
-        val capture = screenCaptureManager
-        if (capture == null) {
-            Toast.makeText(this, "Screen capture not ready — restart service", Toast.LENGTH_LONG).show()
             return
         }
         val targets = TargetRepository(this).getAll().filter { it.enabled }
@@ -180,51 +152,39 @@ class FloatingOverlayService : Service() {
 
         isDetecting = true
         currentStepIndex = 0
-        updateUI("Starting…", targets[0].textQuery)
+        updateUI("Running…", "Step 1/${targets.size}")
 
         detectionJob = scope.launch {
-            // Give the virtual display time to produce its first frame
-            delay(1500L)
-
             while (isActive && isDetecting) {
-                val enabledTargets = TargetRepository(this@FloatingOverlayService).getAll()
-                    .filter { it.enabled }
+                val enabledTargets = TargetRepository(this@FloatingOverlayService)
+                    .getAll().filter { it.enabled }
                 if (enabledTargets.isEmpty()) break
 
-                // Sequential: only look for current step's target
                 val stepIdx = currentStepIndex % enabledTargets.size
-                val currentTarget: DetectionTarget = enabledTargets[stepIdx]
+                val target: DetectionTarget = enabledTargets[stepIdx]
+                val totalSteps = enabledTargets.size
 
                 withContext(Dispatchers.Main) {
-                    updateUI("Step ${stepIdx + 1}/${enabledTargets.size}", currentTarget.textQuery)
+                    updateUI("Step ${stepIdx + 1}/$totalSteps", "")
                 }
 
-                val bitmap = withContext(Dispatchers.IO) { capture.captureScreen() }
-
-                if (bitmap == null) {
-                    Log.w(TAG, "No bitmap captured yet")
-                    delay(POLL_INTERVAL_MS)
-                    continue
+                // Use accessibility node finder (not OCR)
+                val tapPoint = withContext(Dispatchers.IO) {
+                    AutoClickAccessibilityService.instance?.findNodeCenter(target.textQuery)
                 }
 
-                val (tapPoint, detectedText) = detectionEngine.findTarget(bitmap, currentTarget)
-                Log.d(TAG, "Step $stepIdx | looking: '${currentTarget.textQuery}' | found: $tapPoint | OCR: $detectedText")
+                Log.d(TAG, "Step $stepIdx '${target.textQuery}' → $tapPoint")
 
                 if (tapPoint != null) {
                     withContext(Dispatchers.Main) {
-                        updateUI("✓ Tapping: ${currentTarget.label}", currentTarget.textQuery)
+                        updateUI("Tapped! Wait…", "Step ${stepIdx + 1}/$totalSteps")
                     }
                     AutoClickAccessibilityService.instance?.tap(tapPoint.x, tapPoint.y)
                     currentStepIndex++
-                    delay(currentTarget.delayAfterMs)
+                    delay(target.delayAfterMs)
                 } else {
-                    // Not found — show what OCR did pick up
-                    val preview = if (detectedText.isNotEmpty())
-                        detectedText.take(40)
-                    else
-                        "(nothing)"
                     withContext(Dispatchers.Main) {
-                        binding.tvStatus.text = "OCR: $preview"
+                        updateUI("Searching…", "Step ${stepIdx + 1}/$totalSteps")
                     }
                     delay(POLL_INTERVAL_MS)
                 }
@@ -268,11 +228,8 @@ class FloatingOverlayService : Service() {
         private const val TAG = "FloatingOverlayService"
         private const val NOTIF_CHANNEL_ID = "smart_auto_clicker"
         private const val NOTIF_ID = 1001
-        private const val POLL_INTERVAL_MS = 400L
+        private const val POLL_INTERVAL_MS = 500L
 
-        const val ACTION_START_WITH_PROJECTION = "com.smartsystem.autoclicker.START_PROJECTION"
         const val ACTION_STOP = "com.smartsystem.autoclicker.STOP"
-        const val EXTRA_RESULT_CODE = "extra_result_code"
-        const val EXTRA_PROJECTION_DATA = "extra_projection_data"
     }
 }
